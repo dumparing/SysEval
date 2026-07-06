@@ -1,0 +1,24 @@
+# Python bytecode cache — regenerated on every run, machine-specific
+__pycache__/
+*.pyc
+
+# Virtualenv — regenerated from requirements.txt
+.venv/
+
+# Secrets: LLM API keys land here in week 6. In .gitignore from day one
+# because the only safe time to ignore a secrets file is before it exists.
+.env
+
+# Local tooling state (Claude Code session config)
+.claude/
+
+# Week 6+: node_modules is huge, regenerated from package.json
+node_modules/
+dashboard/dist/
+
+# macOS Finder droppings
+.DS_Store
+
+# Local AI-pairing config + private study material — on disk, not public
+CLAUDE.md
+docs/STUDY_GUIDE.md
