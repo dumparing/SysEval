@@ -1,0 +1,36 @@
+# SysEval cluster: one coordinator, N workers (docker compose up --scale
+# worker=4), one Redis. Compose gives every service a DNS name on a private
+# network — that's why COORDINATOR_URL can just say "coordinator".
+services:
+  redis:
+    image: redis:7-alpine
+    # No published port on purpose: only the coordinator talks to Redis,
+    # over the compose network. Workers CAN'T reach it even if they tried —
+    # the single-authority rule, enforced by topology.
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: coordinator/Dockerfile
+    ports:
+      - "8000:8000"   # humans, submit scripts, and curl live on the host
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      COORDINATOR_URL: http://coordinator:8000
+    volumes:
+      # The host's Docker socket. Workers spawn sandbox containers as
+      # SIBLINGS via the host daemon (there is no daemon inside a worker).
+      # This is a real privilege grant — socket access ≈ root on the host —
+      # acceptable for a local cluster of OUR OWN images; on real multi-
+      # tenant infra you'd use a remote builder or rootless runtimes.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - coordinator

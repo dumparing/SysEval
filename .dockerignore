@@ -1,0 +1,9 @@
+# Keep image build contexts small and free of local-only material.
+.venv/
+.git/
+__pycache__/
+*.pyc
+docs/
+dashboard/
+.claude/
+CLAUDE.md

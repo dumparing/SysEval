@@ -17,10 +17,8 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from enum import Enum
@@ -94,14 +92,23 @@ class EvalResult:
         }
 
 
-def _sandbox(src_dir: Path, command: str) -> subprocess.CompletedProcess | None:
-    """Run one command in a fresh locked-down container. None = outer timeout."""
+def _sandbox(source: str, command: str) -> subprocess.CompletedProcess | None:
+    """Run one command in a fresh locked-down container. None = outer timeout.
+
+    The C source travels over STDIN (`docker run -i` + `cat > prog.c`)
+    rather than a bind mount. Why: workers may themselves live in
+    containers (docker-compose) while talking to the HOST's Docker daemon
+    through /var/run/docker.sock — sandbox containers are their SIBLINGS,
+    not children, and a host daemon can't bind-mount a path that only
+    exists inside the worker's filesystem. Bytes over stdin work from
+    anywhere; paths only work from the host.
+    """
     try:
         return subprocess.run(
-            ["docker", "run", "--rm", *SANDBOX_FLAGS,
-             "-v", f"{src_dir}:/src:ro",  # source enters read-only: the only door in
-             IMAGE, "bash", "-c", command],
-            capture_output=True, text=True, timeout=DOCKER_TIMEOUT_S,
+            ["docker", "run", "--rm", "-i", *SANDBOX_FLAGS,
+             IMAGE, "bash", "-c", f"cat > prog.c && {command}"],
+            input=source, capture_output=True, text=True,
+            timeout=DOCKER_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
         return None
@@ -193,77 +200,74 @@ def _parse_cppcheck(stderr: str) -> list[dict]:
 
 def evaluate(c_path: Path) -> EvalResult:
     result = EvalResult(source=c_path.name)
-    with tempfile.TemporaryDirectory() as td:
-        src_dir = Path(td)
-        # Normalize the filename so every stage and parser sees prog.c
-        shutil.copy(c_path, src_dir / "prog.c")
+    source = c_path.read_text()
 
-        # -- stage 1: strict compile ----------------------------------------
-        proc = _sandbox(src_dir, "gcc -Wall -Wextra -Werror -g /src/prog.c -o prog")
-        if proc is None or proc.returncode != 0:
-            result.verdict = Verdict.COMPILE_ERROR
-            result.detail = (proc.stderr.strip() if proc else "docker timeout")[:2000]
-            return result
-        result.compiled = True
+    # -- stage 1: strict compile ----------------------------------------
+    proc = _sandbox(source, "gcc -Wall -Wextra -Werror -g prog.c -o prog")
+    if proc is None or proc.returncode != 0:
+        result.verdict = Verdict.COMPILE_ERROR
+        result.detail = (proc.stderr.strip() if proc else "docker timeout")[:2000]
+        return result
+    result.compiled = True
 
-        # -- stage 2: static scan (advisory: recorded, never the verdict) ----
-        proc = _sandbox(src_dir, "cppcheck --enable=warning --xml /src/prog.c")
-        if proc is not None:
-            result.cppcheck = _parse_cppcheck(proc.stderr)
+    # -- stage 2: static scan (advisory: recorded, never the verdict) ----
+    proc = _sandbox(source, "cppcheck --enable=warning --xml prog.c")
+    if proc is not None:
+        result.cppcheck = _parse_cppcheck(proc.stderr)
 
-        # -- stage 3: functional run -----------------------------------------
-        # Plain -g build, no -Werror: strictness was already enforced once.
-        # `timeout` makes an infinite loop exit 124 instead of hanging us.
-        proc = _sandbox(
-            src_dir, f"gcc -g /src/prog.c -o prog && timeout {RUN_TIMEOUT_S} ./prog"
-        )
-        if proc is None or proc.returncode == 124:
-            result.verdict = Verdict.TIMEOUT
-            result.detail = "program exceeded time limit"
-            return result
-        # 137 = 128 + SIGKILL: the kernel OOM killer fired when the program
-        # crossed --memory=256m. No point running the sanitizer build — it
-        # needs MORE memory and would just OOM again.
-        if proc.returncode == 137:
-            result.verdict = Verdict.RESOURCE_KILL
-            result.detail = "SIGKILL — exceeded the 256MB container memory limit"
-            return result
-        result.tests_passed = proc.returncode == 0
+    # -- stage 3: functional run -----------------------------------------
+    # Plain -g build, no -Werror: strictness was already enforced once.
+    # `timeout` makes an infinite loop exit 124 instead of hanging us.
+    proc = _sandbox(
+        source, f"gcc -g prog.c -o prog && timeout {RUN_TIMEOUT_S} ./prog"
+    )
+    if proc is None or proc.returncode == 124:
+        result.verdict = Verdict.TIMEOUT
+        result.detail = "program exceeded time limit"
+        return result
+    # 137 = 128 + SIGKILL: the kernel OOM killer fired when the program
+    # crossed --memory=256m. No point running the sanitizer build — it
+    # needs MORE memory and would just OOM again.
+    if proc.returncode == 137:
+        result.verdict = Verdict.RESOURCE_KILL
+        result.detail = "SIGKILL — exceeded the 256MB container memory limit"
+        return result
+    result.tests_passed = proc.returncode == 0
 
-        # -- stage 4: sanitizer run --------------------------------------------
-        # -fno-sanitize-recover=all: first UBSan finding aborts the program,
-        # so the report is unambiguous instead of a stream of cascading errors.
-        # detect_leaks=0: LeakSanitizer needs the ptrace capability that
-        # --cap-drop=ALL removed, and leaks are not in our v1 taxonomy anyway.
-        proc = _sandbox(
-            src_dir,
-            "gcc -g -fsanitize=address,undefined -fno-sanitize-recover=all "
-            "/src/prog.c -o prog && "
-            "ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 "
-            f"timeout {RUN_TIMEOUT_S} ./prog",
-        )
-        if proc is None:
-            result.verdict = Verdict.TIMEOUT
-            result.detail = "sanitizer run exceeded time limit"
-            return result
+    # -- stage 4: sanitizer run --------------------------------------------
+    # -fno-sanitize-recover=all: first UBSan finding aborts the program,
+    # so the report is unambiguous instead of a stream of cascading errors.
+    # detect_leaks=0: LeakSanitizer needs the ptrace capability that
+    # --cap-drop=ALL removed, and leaks are not in our v1 taxonomy anyway.
+    proc = _sandbox(
+        source,
+        "gcc -g -fsanitize=address,undefined -fno-sanitize-recover=all "
+        "prog.c -o prog && "
+        "ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 "
+        f"timeout {RUN_TIMEOUT_S} ./prog",
+    )
+    if proc is None:
+        result.verdict = Verdict.TIMEOUT
+        result.detail = "sanitizer run exceeded time limit"
+        return result
 
-        result.defects = _parse_sanitizer(proc.stderr)
-        if result.defects:
-            # Memory verdict outranks a failing test: the memory bug explains
-            # the test failure; the reverse tells us nothing.
-            result.verdict = result.defects[0].kind
-            result.detail = result.defects[0].message
-        elif proc.returncode == 124:
-            result.verdict = Verdict.TIMEOUT
-            result.detail = "sanitizer run exceeded time limit"
-        elif proc.returncode != 0:
-            result.verdict = Verdict.OTHER_MEMORY_ERROR
-            result.detail = f"nonzero exit {proc.returncode} with no parsed report"
-        elif not result.tests_passed:
-            result.verdict = Verdict.TEST_FAIL
-            result.detail = "sanitizers clean but program exited nonzero"
-        else:
-            result.verdict = Verdict.CLEAN
+    result.defects = _parse_sanitizer(proc.stderr)
+    if result.defects:
+        # Memory verdict outranks a failing test: the memory bug explains
+        # the test failure; the reverse tells us nothing.
+        result.verdict = result.defects[0].kind
+        result.detail = result.defects[0].message
+    elif proc.returncode == 124:
+        result.verdict = Verdict.TIMEOUT
+        result.detail = "sanitizer run exceeded time limit"
+    elif proc.returncode != 0:
+        result.verdict = Verdict.OTHER_MEMORY_ERROR
+        result.detail = f"nonzero exit {proc.returncode} with no parsed report"
+    elif not result.tests_passed:
+        result.verdict = Verdict.TEST_FAIL
+        result.detail = "sanitizers clean but program exited nonzero"
+    else:
+        result.verdict = Verdict.CLEAN
 
     return result
 
